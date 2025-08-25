@@ -17,7 +17,7 @@ def load_and_clean_data():
     print(f"Starts file loaded: {len(starts_df)} records")
     
     # Load summary file
-    summary_df = pd.read_excel('summary file - all of 2024.xlsx')
+    summary_df = pd.read_excel('summary file - all of 2024.xlsx', header=None)
     print(f"Summary file loaded: {len(summary_df)} records")
     
     # Load PTC roster
@@ -48,6 +48,8 @@ def process_ptc_roster(ptc_roster):
         print("Could not find 'Total Alstom' column, using column 18 as default")
         alstom_col = 18
     
+    print(f"Alstom column found at index: {alstom_col}")
+    
     # Create equipment mapping
     equipment_ptc = {}
     
@@ -76,49 +78,116 @@ def process_ptc_roster(ptc_roster):
                     continue
     
     print(f"Equipment-PTC mapping created: {len(equipment_ptc)} equipment pieces")
+    
+    # Count by system
+    alstom_count = sum(1 for ptc in equipment_ptc.values() if ptc == 'Alstom')
+    siemens_count = sum(1 for ptc in equipment_ptc.values() if ptc == 'Siemens')
+    print(f"Alstom equipment: {alstom_count}, Siemens equipment: {siemens_count}")
+    
     return equipment_ptc
 
-def extract_lead_equipment(summary_df):
-    """Extract lead equipment (locomotive) from summary file"""
-    print("Extracting lead equipment from summary file...")
+def extract_equipment_from_summary(summary_df):
+    """Extract equipment list and engine type from summary file"""
+    print("Extracting equipment from summary file...")
     
-    # Create mapping from consist to lead equipment
-    consist_to_equipment = {}
+    summary_equipment = {}
     
     for _, row in summary_df.iterrows():
         try:
-            consist = row.iloc[2]  # Column 2 is Consist
-            equipment = row.iloc[4]  # Column 4 is Equipment (locomotive)
+            # Column 2 is Consist (train number)
+            # Column 4 is Equipment (locomotive)
+            # Column 18 is engine type
+            consist = row.iloc[2]
+            equipment = row.iloc[4]
+            engine_type = row.iloc[18] if len(row) > 18 else None
             
             if pd.notna(consist) and pd.notna(equipment):
                 try:
                     consist = str(int(float(consist)))
                     equipment = int(float(equipment))
-                    consist_to_equipment[consist] = equipment
+                    summary_equipment[consist] = {
+                        'equipment': equipment,
+                        'engine_type': engine_type
+                    }
                 except (ValueError, TypeError):
                     continue
         except IndexError:
             continue
     
-    print(f"Consist to equipment mapping created: {len(consist_to_equipment)} entries")
-    return consist_to_equipment
+    print(f"Summary equipment mapping created: {len(summary_equipment)} entries")
+    return summary_equipment
 
-def match_delays_to_equipment(ptc_delays, consist_to_equipment, equipment_ptc):
-    """Match delays to equipment and PTC systems"""
+def get_day_of_week(date_obj):
+    """Get day of week abbreviation (MF, SS, SA, etc.)"""
+    if pd.isna(date_obj):
+        return None
+    
+    # Check if it's a holiday (simplified - you may need to add more holidays)
+    holidays_2024 = [
+        '2024-01-01', '2024-01-15', '2024-02-19', '2024-05-27', 
+        '2024-07-04', '2024-09-02', '2024-10-14', '2024-11-11', 
+        '2024-11-28', '2024-12-25'
+    ]
+    
+    date_str = date_obj.strftime('%Y-%m-%d')
+    if date_str in holidays_2024:
+        return 'SS'  # Sunday schedule for holidays
+    
+    # Get day of week
+    weekday = date_obj.weekday()
+    day_mapping = {
+        0: 'MF',  # Monday
+        1: 'MF',  # Tuesday  
+        2: 'MF',  # Wednesday
+        3: 'MF',  # Thursday
+        4: 'MF',  # Friday
+        5: 'SA',  # Saturday
+        6: 'SS'   # Sunday
+    }
+    return day_mapping.get(weekday, 'MF')
+
+def match_delays_to_equipment(ptc_delays, summary_equipment, starts_df, equipment_ptc):
+    """Match delays to equipment using the cross-matching logic"""
     print("Matching delays to equipment...")
     
     results = []
     
     for _, delay in ptc_delays.iterrows():
-        train_id = str(delay['TRAINID'])  # Convert to string for matching
+        train_id = str(delay['TRAINID'])
+        delay_date = delay['Date']
+        
+        # Get day of week for this delay
+        day_of_week = get_day_of_week(delay_date)
         
         # Try to find equipment for this train
         lead_equipment = None
         ptc_system = None
+        engine_type = None
         
-        if train_id in consist_to_equipment:
-            lead_equipment = consist_to_equipment[train_id]
+        # First try to match from summary file
+        if train_id in summary_equipment:
+            lead_equipment = summary_equipment[train_id]['equipment']
+            engine_type = summary_equipment[train_id]['engine_type']
             ptc_system = equipment_ptc.get(lead_equipment)
+        
+        # If not found in summary, try starts file
+        if lead_equipment is None:
+            # Look for this train in starts file for the specific day
+            starts_filtered = starts_df[
+                (starts_df['move'] == train_id) & 
+                (starts_df['day'] == day_of_week)
+            ]
+            
+            if len(starts_filtered) > 0:
+                # Extract first equipment (locomotive) from equipment string
+                equipment_str = str(starts_filtered.iloc[0]['equipment'])
+                parts = equipment_str.split()
+                if len(parts) >= 1:
+                    try:
+                        lead_equipment = int(float(parts[0]))
+                        ptc_system = equipment_ptc.get(lead_equipment)
+                    except (ValueError, TypeError):
+                        pass
         
         results.append({
             'date': delay['Date'],
@@ -126,12 +195,14 @@ def match_delays_to_equipment(ptc_delays, consist_to_equipment, equipment_ptc):
             'delay_cause': delay['DELAYCAUSE'],
             'delay_minutes': delay['Delay (Minutes)'],
             'lead_equipment': lead_equipment,
-            'ptc_system': ptc_system
+            'ptc_system': ptc_system,
+            'engine_type': engine_type,
+            'day_of_week': day_of_week
         })
     
     return pd.DataFrame(results)
 
-def analyze_results(results_df):
+def analyze_results(results_df, equipment_ptc):
     """Analyze results and answer questions"""
     print("\n" + "="*50)
     print("ANALYSIS RESULTS")
@@ -159,26 +230,19 @@ def analyze_results(results_df):
         print(f"   {expected_reduction:.1f} minutes ({expected_reduction/60:.1f} hours)")
         print(f"   (Alstom avg: {alstom_avg_delay:.1f} min, Siemens avg: {siemens_avg_delay:.1f} min)")
     
-    # Question 2: How many pieces of fleet have Alstom PTC
-    alstom_equipment = set()
-    siemens_equipment = set()
+    # Question 2 & 4: Equipment counts from PTC roster
+    alstom_equipment_count = sum(1 for ptc in equipment_ptc.values() if ptc == 'Alstom')
+    siemens_equipment_count = sum(1 for ptc in equipment_ptc.values() if ptc == 'Siemens')
     
-    for _, row in results_df.iterrows():
-        if row['ptc_system'] == 'Alstom' and pd.notna(row['lead_equipment']):
-            alstom_equipment.add(row['lead_equipment'])
-        elif row['ptc_system'] == 'Siemens' and pd.notna(row['lead_equipment']):
-            siemens_equipment.add(row['lead_equipment'])
-    
-    print(f"\n2. Pieces of fleet with Alstom PTC: {len(alstom_equipment)}")
-    print(f"   Equipment numbers: {sorted(alstom_equipment)}")
+    print(f"\n2. Pieces of fleet with Alstom PTC: {alstom_equipment_count}")
+    print(f"   (From PTC Vehicle Roster)")
     
     # Question 3: Alstom PTC delays in 2024
     print(f"\n3. Alstom PTC delays in 2024: {len(alstom_delays)}")
     print(f"   Total delay time: {alstom_total_delay:.1f} minutes ({alstom_total_delay/60:.1f} hours)")
     
-    # Question 4: How many pieces of fleet have Siemens PTC
-    print(f"\n4. Pieces of fleet with Siemens PTC: {len(siemens_equipment)}")
-    print(f"   Equipment numbers: {sorted(siemens_equipment)}")
+    print(f"\n4. Pieces of fleet with Siemens PTC: {siemens_equipment_count}")
+    print(f"   (From PTC Vehicle Roster)")
     
     # Question 5: Siemens PTC delays in 2024
     print(f"\n5. Siemens PTC delays in 2024: {len(siemens_delays)}")
@@ -200,8 +264,8 @@ def analyze_results(results_df):
         print(f"  {cause}: {count}")
     
     return {
-        'alstom_equipment_count': len(alstom_equipment),
-        'siemens_equipment_count': len(siemens_equipment),
+        'alstom_equipment_count': alstom_equipment_count,
+        'siemens_equipment_count': siemens_equipment_count,
         'alstom_delays_2024': len(alstom_delays),
         'siemens_delays_2024': len(siemens_delays),
         'expected_reduction': expected_reduction if 'expected_reduction' in locals() else None
@@ -209,7 +273,7 @@ def analyze_results(results_df):
 
 def main():
     """Main analysis function"""
-    print("NJ TRANSIT PTC DELAY ANALYSIS")
+    print("NJ TRANSIT PTC DELAY ANALYSIS - FINAL VERSION")
     print("="*50)
     
     # Load data
@@ -221,18 +285,18 @@ def main():
     # Process PTC roster
     equipment_ptc = process_ptc_roster(ptc_roster)
     
-    # Extract lead equipment
-    consist_to_equipment = extract_lead_equipment(summary_df)
+    # Extract equipment from summary file
+    summary_equipment = extract_equipment_from_summary(summary_df)
     
     # Match delays to equipment
-    results_df = match_delays_to_equipment(ptc_delays, consist_to_equipment, equipment_ptc)
+    results_df = match_delays_to_equipment(ptc_delays, summary_equipment, starts_df, equipment_ptc)
     
     # Analyze results
-    analysis_results = analyze_results(results_df)
+    analysis_results = analyze_results(results_df, equipment_ptc)
     
     # Save results
-    results_df.to_csv('ptc_analysis_results.csv', index=False)
-    print(f"\nDetailed results saved to 'ptc_analysis_results.csv'")
+    results_df.to_csv('ptc_analysis_results_final.csv', index=False)
+    print(f"\nDetailed results saved to 'ptc_analysis_results_final.csv'")
     
     return analysis_results
 
